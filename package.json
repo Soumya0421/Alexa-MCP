@@ -1,0 +1,26 @@
+{
+  "name": "alexa-live-web-research-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A self-hosted MCP server for live web research with Alexa+",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/research.fixtures.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "^2.1.1",
+    "@modelcontextprotocol/server": "^2.3.0",
+    "cheerio": "^1.2.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.0"
+  }
+}

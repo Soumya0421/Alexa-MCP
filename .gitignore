@@ -1,0 +1,9 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Node.js project files
+node_modules/
+dist/
+.env
+npm-debug.log*

@@ -1,0 +1,11 @@
+[workspace]
+authors = ["Soumya Das <soumyadasjr@gmail.com>"]
+channels = ["conda-forge"]
+name = "alexa_mcp"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+nodejs = ">=26.10.0,<26.11"
