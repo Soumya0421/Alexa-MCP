@@ -6,9 +6,11 @@ const SEARCH_TIMEOUT_MS = 8_000;
 const PAGE_TIMEOUT_MS = 6_000;
 const MAX_SEARCH_RESPONSE_BYTES = 1_000_000;
 const MAX_PAGE_BYTES = 2_000_000;
-const MAX_EXTRACTED_TEXT_CHARS = 2_500;
+const MAX_EXTRACTED_TEXT_CHARS = 40_000;
 const MAX_FOLLOWUP_CLAIMS = 2;
 const MAX_FOLLOWUP_SEARCHES = 2;
+const MAX_INITIAL_FETCH_CANDIDATES = 4;
+const MAX_UNIQUE_FETCH_ATTEMPTS = 6;
 
 export type Recency = 'day' | 'week' | 'month' | 'year' | 'any';
 
@@ -34,6 +36,12 @@ export interface ResearchSource {
   extractedText: string;
   relevanceScore: number | null;
   queryRelevance: number;
+  targetRelevance: number;
+  selectionScore: number;
+  selectionReasons: string[];
+  selectionOutcome: 'selected' | 'replacement' | 'duplicate' | 'skipped' | 'fetch_limit';
+  truncated: boolean;
+  requiresBrowserRendering: boolean;
   fetchError?: string;
 }
 
@@ -47,7 +55,7 @@ export interface Finding {
   type: FindingType;
   verificationRequired: boolean;
   /** Kept as a compatibility alias for existing consumers. */
-  claimType: 'fact' | 'opinion';
+  claimType: FindingType;
   sourceIds: string[];
   contradictingSourceIds: string[];
   evidence: Evidence[];
@@ -58,6 +66,8 @@ export interface Finding {
   independentSourceCount: number;
   corroborationStatus: FindingStatus;
   relevanceScore: number;
+  targetRelevance: number;
+  materialFigures: Array<{ raw: string; metric: string; normalizedValue: number; unit: string }>;
 }
 export interface ResearchSummary {
   query: string;
@@ -67,12 +77,28 @@ export interface ResearchSummary {
   followupSearchCount: number;
   researchDepth: 0 | 1;
   trace: ResearchTrace;
-  coverage: { searchResults: number; uniqueSources: number; fetchedPages: number; usablePages: number; failedPages: number; adequate: boolean; adequacyReasons: string[] };
+  researchTarget: string;
+  sourceSelection: SourceSelectionSummary;
+  coverage: { searchResults: number; uniqueSources: number; fetchedPages: number; usablePages: number; failedPages: number; distinctDomains: number; distinctDevelopments: number; recentDevelopments: number; independentCorroboratingSources: number; unresolvedMaterialConflicts: number; adequate: boolean; adequacyReasons: string[] };
   findings: Finding[];
-  sources: Array<{ id: string; title: string; url: string; domain: string; sourceType: SourceType; publishedAt: string | null; relevanceScore: number | null; queryRelevance: number; retrievedAt: string; fetchError?: string }>;
+  sources: Array<{ id: string; title: string; url: string; domain: string; sourceType: SourceType; publishedAt: string | null; relevanceScore: number | null; queryRelevance: number; targetRelevance: number; selectionScore: number; selectionReasons: string[]; selectionOutcome: ResearchSource['selectionOutcome']; truncated: boolean; requiresBrowserRendering: boolean; retrievedAt: string; fetchError?: string }>;
   corroboration: Array<{ claim: string; sourceIds: string[]; corroborationCount: number; status: FindingStatus }>;
   disagreements: Array<{ claims: string[]; sourceIds: string[]; reason: string }>;
   limitations: string[];
+}
+
+export interface SourceSelectionSummary {
+  totalResultsDiscovered: number;
+  candidatesRanked: number;
+  fetchAttempts: number;
+  pagesSuccessfullyFetched: number;
+  usablePages: number;
+  failedPages: number;
+  truncatedPages: number;
+  replacementsUsed: boolean;
+  replacementCandidatesAttempted: number;
+  adequatelyAnswersTarget: boolean;
+  candidates: Array<{ title: string; url: string; score: number; reasons: string[]; decision: string; sourceId?: string }>;
 }
 
 export interface ResearchTrace {
@@ -338,29 +364,44 @@ function isBoilerplate(text: string): boolean {
     || /^\s*(copyright|©|home\s*[|>]|menu\s*[|>])/i.test(text);
 }
 
-function extractRelevantText($: cheerio.CheerioAPI, query: string, title: string): string {
-  const paragraphs = $('article p, main p, [role="main"] p, p')
-    .toArray()
-    .map((element, index) => ({ text: cleanText($(element).text()), index }))
-    .filter((paragraph) => paragraph.text.length > 35 && !isBoilerplate(paragraph.text));
+interface ExtractedPageText { text: string; truncated: boolean; requiresBrowserRendering: boolean }
 
-  // Prefer paragraphs that explain the query. If none score well, retain only
-  // a few substantial paragraphs rather than dumping the page chrome/body.
-  const ranked = paragraphs.map((paragraph) => ({
-    ...paragraph,
-    score: scoreRelevance(query, paragraph.text, title, ''),
-  }));
-  const relevant = ranked.filter((paragraph) => paragraph.score >= 0.16);
-  const chosen = (relevant.length ? relevant : ranked.filter((item) => item.text.length >= 100))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, 8);
-  let result = '';
-  for (const paragraph of chosen) {
-    const addition = `${result ? '\n\n' : ''}${paragraph.text}`;
-    if (result.length + addition.length > MAX_EXTRACTED_TEXT_CHARS) continue;
-    result += addition;
+function extractRelevantText($: cheerio.CheerioAPI, query: string, title: string, hadScripts = false): ExtractedPageText {
+  const contentRoot = $('article, main, [role="main"]').first();
+  const root = contentRoot.length ? contentRoot : $('body');
+  const nodes = root.find('h1, h2, h3, h4, p, li, caption, figcaption, blockquote, tr').toArray();
+  const seen = new Set<string>();
+  const blocks = nodes.map((element, index) => {
+    const $element = $(element);
+    const text = cleanText($element.is('tr')
+      ? $element.find('th,td').map((_i, cell) => cleanText($(cell).text())).get().join(' | ')
+      : $element.text());
+    const tag = ($(element).prop('tagName') ?? '').toLowerCase();
+    return { text, index, heading: /^h[1-4]$/.test(tag), contentBlock: ['li', 'caption', 'figcaption', 'tr', 'blockquote'].includes(tag) };
+  }).filter(({ text, heading }) => {
+    const key = normalizedTitle(text);
+    if (text.length < (heading ? 4 : 25) || isBoilerplate(text) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const ranked = blocks.map((block) => ({ ...block, score: scoreRelevance(query, block.text, title, '') }));
+  const relevant = ranked.filter((block) => block.score >= 0.12 || block.heading || block.contentBlock);
+  const chosen = (relevant.length ? relevant : ranked.filter((item) => item.text.length >= 80))
+    .sort((left, right) => right.score - left.score || left.index - right.index);
+  let text = '';
+  let truncated = false;
+  for (const block of chosen) {
+    const addition = `${text ? '\n\n' : ''}${block.text}`;
+    if (text.length + addition.length > MAX_EXTRACTED_TEXT_CHARS) {
+      const remaining = MAX_EXTRACTED_TEXT_CHARS - text.length;
+      if (remaining > 0) text += addition.slice(0, remaining);
+      truncated = true;
+      break;
+    }
+    text += addition;
   }
-  return result;
+  const requiresBrowserRendering = text.length < 80 && (hadScripts || /enable javascript|javascript required/i.test($('body').text()));
+  return { text, truncated, requiresBrowserRendering };
 }
 
 function normalizeUrl(value: string): string | null {
@@ -451,6 +492,12 @@ async function fetchSource(result: SearchResult & { duplicates: ReturnType<typeo
     extractedText: '',
     relevanceScore: result.score,
     queryRelevance: scoreRelevance(query, result.content, result.title, ''),
+    targetRelevance: scoreTargetRelevance(query, result.content, result.title),
+    selectionScore: 0,
+    selectionReasons: [],
+    selectionOutcome: 'selected',
+    truncated: false,
+    requiresBrowserRendering: false,
   };
 
   try {
@@ -474,16 +521,21 @@ async function fetchSource(result: SearchResult & { duplicates: ReturnType<typeo
     if (canonical) {
       try { source.canonicalUrl = new URL(canonical, result.url).toString(); } catch { /* Ignore invalid canonical metadata. */ }
     }
-    $('script, style, noscript, nav, footer, header, aside, form, svg, iframe, [aria-hidden="true"]').remove();
+    const hadScripts = $('script').length > 0;
+    $('script, style, noscript, nav, footer, header, aside, form, svg, iframe, [aria-hidden="true"], [hidden], [style*="display:none"], [style*="visibility:hidden"]').remove();
 
     source.publishedAt = dates.publishedAt ?? source.publishedAt;
     source.updatedAt = dates.updatedAt ?? source.updatedAt;
-    source.extractedText = extractRelevantText($, query, source.title);
+    const extraction = extractRelevantText($, query, source.title, hadScripts);
+    source.extractedText = extraction.text;
+    source.truncated = extraction.truncated;
+    source.requiresBrowserRendering = extraction.requiresBrowserRendering;
     source.queryRelevance = scoreRelevance(query, source.extractedText, source.title, source.searchSnippet);
+    source.targetRelevance = scoreTargetRelevance(query, source.extractedText, source.title);
   } catch (error) {
     source.fetchError = error instanceof Error ? error.message : 'The page could not be fetched.';
-    // Keep the search provider's snippet so a blocked page can still be cited usefully.
-    source.extractedText = source.searchSnippet;
+    // Search snippets remain discovery metadata and never become evidence.
+    source.extractedText = '';
   }
 
   return source;
@@ -503,6 +555,25 @@ function meaningfulTokens(text: string): string[] {
     .filter((token) => (token.length > 1 || /^[A-Z]$/.test(token)) && !STOP_WORDS.has(token.toLowerCase()))
     .map((token) => token.toLowerCase())
     .map((token) => launchWords.has(token) ? 'launch' : token))];
+}
+
+function researchTargetFor(query: string): string {
+  if (!isVerificationQuery(query)) return query.trim();
+  const words = meaningfulTokens(query).filter((word) => !FOLLOWUP_STOP_WORDS.has(word));
+  const years = words.filter((word) => /^20\d{2}$/.test(word));
+  const topic = words.filter((word) => !years.includes(word)).join(' ') || query;
+  return `Determine whether ${topic}${years.length ? ` in ${years.join(', ')}` : ''} was proved or disproved.`;
+}
+
+function scoreTargetRelevance(query: string, text: string, title = '', context = ''): number {
+  const base = scoreRelevance(query, text, title, context);
+  if (!isVerificationQuery(query)) return base;
+  const combined = `${title} ${text}`;
+  const directEvidence = /\b(proof|proved|proven|solve(?:d)?|unsolved|unproven|not solved|no proof|not prove|attempt(?:ed)?|disproved|refuted|open problem)\b/i.test(combined);
+  const year = query.match(/\b20\d{2}\b/)?.[0];
+  const yearMatch = year && combined.includes(year) ? 0.12 : 0;
+  const historicalOnly = /\b(born|proposed|formulated|introduced|published in 18\d{2}|history of)\b/i.test(combined) && !directEvidence;
+  return Math.max(0, Math.min(1, base + (directEvidence ? 0.3 : 0) + yearMatch - (historicalOnly ? 0.25 : 0)));
 }
 
 function scoreRelevance(query: string, sentence: string, title: string, context: string): number {
@@ -533,7 +604,45 @@ function splitSentences(text: string): string[] {
   return text.replace(/\n+/g, ' ').split(/(?<=[.!?])\s+(?=[A-Z0-9“"'])/u).map(cleanText).filter(Boolean);
 }
 
-interface Candidate { text: string; source: ResearchSource; type: FindingType; tokens: Set<string>; values: string; relevance: number; verificationRequired: boolean; context: string }
+interface MaterialFigure { raw: string; metric: string; normalizedValue: number; unit: string }
+interface Candidate { text: string; source: ResearchSource; type: FindingType; tokens: Set<string>; values: string; figures: MaterialFigure[]; relevance: number; targetRelevance: number; verificationRequired: boolean; context: string }
+
+/** Normalize common financial units while retaining the exact source wording. */
+function materialFigures(sentence: string): MaterialFigure[] {
+  const figures: MaterialFigure[] = [];
+  const money = /([$€£])\s*(\d[\d,]*(?:\.\d+)?)\s*(billion|bn|b|million|m|thousand|k)?/gi;
+  for (const match of sentence.matchAll(money)) {
+    const raw = match[0].trim();
+    const scale = /^(?:billion|bn|b)$/i.test(match[3] ?? '') ? 1_000_000_000
+      : /^(?:million|m)$/i.test(match[3] ?? '') ? 1_000_000
+        : /^(?:thousand|k)$/i.test(match[3] ?? '') ? 1_000 : 1;
+    const before = sentence.slice(Math.max(0, (match.index ?? 0) - 28), match.index).toLowerCase();
+    const after = sentence.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 18).toLowerCase();
+    const metric = /valu(?:ation|ed)/.test(`${before.slice(-12)} ${after}`) ? 'valuation'
+      : /rais(?:e|ed)|fund(?:ing|raise)|investment|round/.test(`${before} ${after.slice(0, 12)}`) ? 'funding_amount' : 'money_amount';
+    figures.push({ raw, metric, normalizedValue: Number(match[2].replace(/,/g, '')) * scale, unit: match[1] });
+  }
+  const percent = /\b(\d+(?:\.\d+)?)\s*%/g;
+  for (const match of sentence.matchAll(percent)) figures.push({ raw: match[0], metric: 'percentage', normalizedValue: Number(match[1]), unit: '%' });
+  const date = sentence.match(/\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*20\d{2})?|\b20\d{2}-\d{2}-\d{2}\b/i);
+  if (date) figures.push({ raw: date[0], metric: 'date', normalizedValue: Date.parse(date[0]), unit: 'date' });
+  const year = sentence.match(/\b20\d{2}\b/);
+  if (year && !figures.some((figure) => figure.metric === 'date' && figure.raw.includes(year[0]))) {
+    figures.push({ raw: year[0], metric: 'year', normalizedValue: Number(year[0]), unit: 'year' });
+  }
+  const counts = sentence.matchAll(/\b(?:about|approximately|nearly|over|more than|reached|total(?:ed)?|with)\s+(\d[\d,]*)\s+(people|users|models|papers|companies|sites|tasks|employees|jobs|cases|products)\b/gi);
+  for (const match of counts) figures.push({ raw: `${match[1]} ${match[2]}`, metric: `count_${match[2].toLowerCase()}`, normalizedValue: Number(match[1].replace(/,/g, '')), unit: match[2].toLowerCase() });
+  return figures;
+}
+
+function figuresConflict(left: Candidate, right: Candidate): boolean {
+  for (const a of left.figures) for (const b of right.figures) {
+    const tolerance = a.metric === 'date' ? 60_000 : Math.max(1, Math.abs(a.normalizedValue) * 0.001);
+    if (a.metric === b.metric && a.unit === b.unit && Number.isFinite(a.normalizedValue) && Number.isFinite(b.normalizedValue)
+      && Math.abs(a.normalizedValue - b.normalizedValue) > tolerance) return true;
+  }
+  return false;
+}
 
 function classifyStatement(sentence: string): FindingType {
   if (OPINION_PATTERN.test(sentence)) return 'opinion';
@@ -555,21 +664,26 @@ function extractCandidates(query: string, sources: ResearchSource[]): Candidate[
   const recentQuery = /\b(latest|recent|today|this week|this month|developments?|updates?|news)\b/i.test(query);
   const academicQuery = /\b(research|paper|study|scientific|theorem|proof)\b/i.test(query);
   for (const source of sources) {
-    if (source.fetchError || source.extractedText.trim().length < 40) continue;
+    if (source.fetchError || source.extractedText.trim().length < 80) continue;
     const sentences = splitSentences(source.extractedText);
     const sourceCandidates: Candidate[] = [];
     sentences.forEach((sentence, index) => {
       if (sentence.length < 40 || sentence.length > 400 || BOILERPLATE_SENTENCE_PATTERN.test(sentence)) return;
       const context = [sentences[index - 1], sentences[index + 1]].filter(Boolean).join(' ');
-      const relevance = scoreRelevance(query, sentence, source.title, context);
+      const relevance = scoreTargetRelevance(query, sentence, source.title, context);
       if (relevance < 0.40) return;
       const type = classifyStatement(sentence);
       if (type === 'unknown') return;
-      const values = (sentence.match(/\b(?:\d{1,4}(?:[,.]\d+)*%?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/gi) ?? []).map((value) => value.toLowerCase()).sort().join('|');
-      const priority = relevance + (recentQuery && source.publishedAt ? 0.04 : 0) + (academicQuery && source.sourceType === 'academic' ? 0.08 : 0) + (source.sourceType === 'primary' ? 0.03 : 0) + Math.min(0.04, source.extractedText.length / 20_000);
-      sourceCandidates.push({ text: sentence, source, type, tokens: new Set(meaningfulTokens(sentence)), values, relevance: priority, verificationRequired: requiresVerification(sentence), context });
+      const directAnswer = isVerificationQuery(query) && /\b(proof|proved|proven|solve(?:d)?|unsolved|unproven|not solved|no proof|not prove|attempt(?:ed)?|disproved|refuted|open problem)\b/i.test(sentence);
+      const historicalBackground = isVerificationQuery(query) && type === 'background' && !directAnswer;
+      const figures = materialFigures(sentence);
+      const values = figures.map((figure) => `${figure.metric}:${figure.normalizedValue}`).sort().join('|');
+      const priority = relevance + (directAnswer ? 0.18 : 0) - (historicalBackground ? 0.2 : 0) + (recentQuery && source.publishedAt ? 0.04 : 0) + (academicQuery && source.sourceType === 'academic' ? 0.08 : 0) + (source.sourceType === 'primary' ? 0.03 : 0) + Math.min(0.04, source.extractedText.length / 20_000);
+      sourceCandidates.push({ text: sentence, source, type, tokens: new Set(meaningfulTokens(sentence)), values, figures, relevance: priority, targetRelevance: priority, verificationRequired: requiresVerification(sentence) || figures.length > 0, context });
     });
-    candidates.push(...sourceCandidates.sort((a, b) => b.relevance - a.relevance).slice(0, 3));
+    // Roundups contain several distinct stories; retaining more candidates lets
+    // separate developments survive without treating them as corroboration.
+    candidates.push(...sourceCandidates.sort((a, b) => b.relevance - a.relevance).slice(0, 10));
   }
   return candidates;
 }
@@ -640,11 +754,13 @@ function makeFinding(group: Candidate[], status: FindingStatus, contradictingSou
   const finalStatus = type === 'opinion' || type === 'prediction' || type === 'unknown' ? 'insufficient_evidence' : status;
   return {
     claim, type, verificationRequired: group.some((item) => item.verificationRequired),
-    claimType: type === 'opinion' ? 'opinion' : 'fact', sourceIds, contradictingSourceIds,
+    claimType: type, sourceIds, contradictingSourceIds,
     evidence: group.map(evidenceFor), publishedAt: selected.source.publishedAt,
     corroborationCount: independentCount, status: finalStatus, sourceCount: sourceIds.length,
     independentSourceCount: independentCount, corroborationStatus: finalStatus,
     relevanceScore: Math.max(...group.map((item) => item.relevance)),
+    targetRelevance: Math.max(...group.map((item) => item.targetRelevance)),
+    materialFigures: [...new Map(group.flatMap((item) => item.figures).map((figure) => [`${figure.metric}:${figure.normalizedValue}`, figure])).values()],
   };
 }
 
@@ -670,7 +786,7 @@ function buildFindings(query: string, sources: ResearchSource[]): { findings: Fi
     for (const item of group) {
       const compatible = variants.find((variant) => {
         const representative = variant[0];
-        return similarity(representative, item) >= 0.42 && (!representative.values || !item.values || representative.values === item.values);
+        return similarity(representative, item) >= 0.42 && !figuresConflict(representative, item);
       });
       if (compatible) compatible.push(item); else variants.push([item]);
     }
@@ -689,7 +805,7 @@ function buildFindings(query: string, sources: ResearchSource[]): { findings: Fi
       findings.push(makeFinding(group, status));
   }
 
-  findings.sort((left, right) => right.relevanceScore - left.relevanceScore || Number(right.verificationRequired) - Number(left.verificationRequired) || right.independentSourceCount - left.independentSourceCount);
+  findings.sort((left, right) => right.targetRelevance - left.targetRelevance || Number(right.verificationRequired) - Number(left.verificationRequired) || right.independentSourceCount - left.independentSourceCount);
   return { findings: findings.slice(0, 10), disagreements };
 }
 
@@ -705,18 +821,22 @@ function isBroadCurrentEventsQuery(query: string): boolean {
 }
 
 function makeRecoveryQuery(query: string, variant = 0): string {
-  const topicTerms = meaningfulTokens(query).filter((word) => !FOLLOWUP_STOP_WORDS.has(word));
-  const topic = topicTerms.slice(0, 4).join(' ') || 'current events';
-  const broad = isBroadCurrentEventsQuery(query);
-  if (broad && /\bAI\b/i.test(query)) {
+  if (isVerificationQuery(query)) {
+    const words = meaningfulTokens(query).filter((word) => !FOLLOWUP_STOP_WORDS.has(word));
+    const year = words.find((word) => /^20\d{2}$/.test(word));
+    const topic = words.filter((word) => word !== year).join(' ') || query;
     return variant === 0
-      ? 'AI news this week'
-      : 'artificial intelligence latest developments this week';
+      ? `${topic} proof ${year ?? ''}`.trim()
+      : `${topic} solved ${year ?? ''} mathematicians`.trim();
   }
+  const topicTerms = meaningfulTokens(query).filter((word) => !FOLLOWUP_STOP_WORDS.has(word));
+  const topic = topicTerms.slice(0, 3).join(' ') || 'current events';
+  const broad = isBroadCurrentEventsQuery(query);
   if (broad) {
+    const timeWindow = query.match(/\b(today|yesterday|this week|this month|this year|since yesterday)\b/i)?.[0] ?? 'recent';
     return variant === 0
-      ? `${topic} news ${query.match(/\b(today|this week|this month|this year|yesterday)\b/i)?.[0] ?? 'recent'}`.trim()
-      : `${topic} latest developments official sources`.trim();
+      ? `${topic} latest launches research company updates ${timeWindow}`.trim()
+      : `${topic} policy safety legal funding research reports ${timeWindow}`.trim();
   }
   return `${topic} additional relevant sources`.trim();
 }
@@ -725,18 +845,135 @@ function checkSearchAdequacy(query: string, searchResults: SearchResult[], batch
   const reasons: string[] = [];
   const broad = isBroadCurrentEventsQuery(query);
   const relevantSources = batchSources.filter((source) => source.queryRelevance >= 0.30);
-  const usableSources = batchSources.filter((source) => !source.fetchError && source.extractedText.trim().length >= 40);
+  const usableSources = batchSources.filter((source) => !source.fetchError && source.extractedText.trim().length >= 80 && source.targetRelevance >= 0.15);
   const extractedFindings = buildFindings(query, batchSources).findings;
 
   if (broad && relevantSources.length < 2) reasons.push('fewer than two relevant results for a broad current-events query');
   if (searchResults.length > 0 && relevantSources.length < Math.ceil(searchResults.length / 2)) reasons.push('most search results appear irrelevant to the query');
   if (usableSources.length === 0) reasons.push('no usable fetched pages');
   if (extractedFindings.length === 0) reasons.push('no relevant findings could be extracted');
+  if (isVerificationQuery(query) && !extractedFindings.some((finding) => finding.targetRelevance >= 0.60)) {
+    reasons.push('no direct-answer evidence was found for the verification target');
+  }
   if (broad && new Set(relevantSources.map((source) => independentDomain(source.domain))).size < 2) {
     reasons.push('insufficient source-domain diversity for a broad current-events query');
   }
+  if (broad && extractedFindings.length < 3) reasons.push('fewer than three distinct developments were identified');
+  if (broad) {
+    const windowDays = /\b(today|since yesterday)\b/i.test(query) ? 2 : /\bthis week\b/i.test(query) ? 14 : /\bthis month\b/i.test(query) ? 45 : 90;
+    const dated = usableSources.map((source) => source.publishedAt ? Date.parse(source.publishedAt) : Number.NaN).filter(Number.isFinite);
+    if (dated.length && !dated.some((timestamp) => (Date.now() - timestamp) / 86_400_000 <= windowDays)) {
+      reasons.push('available dated sources fall outside the requested recent time window');
+    }
+  }
 
   return { adequate: reasons.length === 0, reasons };
+}
+
+export interface RankedSearchCandidate {
+  result: SearchResult & { duplicates: ReturnType<typeof duplicateInfo>[] };
+  score: number;
+  reasons: string[];
+}
+
+function likelyCopiedSnippet(left: string, right: string): boolean {
+  const leftWords = new Set(meaningfulTokens(left));
+  const rightWords = new Set(meaningfulTokens(right));
+  if (leftWords.size < 8 || rightWords.size < 8) return false;
+  const shared = [...leftWords].filter((word) => rightWords.has(word)).length;
+  return shared / Math.max(1, new Set([...leftWords, ...rightWords]).size) >= 0.82;
+}
+
+export function rankSearchResults(query: string, results: SearchResult[], existingDomains: string[] = [], priorFailedDomains: string[] = []): RankedSearchCandidate[] {
+  const recent = /\b(latest|recent|today|yesterday|this week|this month|this year|news|developments?|updates?)\b/i.test(query);
+  const verification = isVerificationQuery(query);
+  const seenDomains = new Set(existingDomains.map((domain) => independentDomain(domain)));
+  const failedDomains = new Set(priorFailedDomains.map((domain) => independentDomain(domain)));
+  const prepared = prepareSearchResults(results);
+  const candidates = prepared.map((result) => {
+    const relevance = scoreTargetRelevance(query, result.content, result.title);
+    const reasons = [`query/title/snippet relevance ${relevance.toFixed(2)}`];
+    let score = relevance * 0.62 + (result.score ?? 0.5) * 0.12;
+    const copied = prepared.some((other) => other !== result
+      && independentDomain(domainOf(other.url)) !== independentDomain(domainOf(result.url))
+      && likelyCopiedSnippet(result.content, other.content));
+    const sourceType = classifySource(result.url, query);
+    if (failedDomains.has(independentDomain(domainOf(result.url)))) {
+      score -= 0.06;
+      reasons.push('another URL on this domain failed earlier in this request');
+    }
+    if (['primary', 'government', 'academic'].includes(sourceType)) {
+      score += 0.07;
+      reasons.push(`${sourceType} source indicator (small heuristic preference)`);
+    }
+    if (sourceType === 'news') score += 0.025;
+    if (/youtube\.com|youtu\.be|instagram\.com|tiktok\.com|x\.com|twitter\.com|facebook\.com/i.test(result.url)) {
+      score -= 0.10;
+      reasons.push('source may need browser rendering and return limited HTTP text');
+    }
+    if (verification && /\b(proof|proved|proven|solved|unsolved|attempt|disproved|refuted)\b/i.test(`${result.title} ${result.content}`)) {
+      score += 0.25;
+      reasons.push('directly addresses the verification question');
+    }
+    const background = /\b(definition|what is|history|overview|introduction|explained|encyclopedia)\b/i.test(result.title);
+    if (background && (recent || verification)) {
+      score -= 0.15;
+      reasons.push('likely background page; less direct for this query');
+    }
+    if (recent && result.publishedDate) {
+      const ageDays = Math.max(0, (Date.now() - Date.parse(result.publishedDate)) / 86_400_000);
+      if (Number.isFinite(ageDays)) {
+        const freshness = ageDays <= 14 ? 0.12 : ageDays > 180 ? -0.10 : 0;
+        score += freshness;
+        reasons.push(freshness > 0 ? 'recent publication date' : freshness < 0 ? 'older publication date' : 'publication date recorded');
+      }
+    }
+    const requestedYear = query.match(/\b20\d{2}\b/)?.[0];
+    if (requestedYear && result.publishedDate) {
+      const matchingYear = result.publishedDate.startsWith(requestedYear);
+      score += matchingYear ? 0.10 : -0.08;
+      reasons.push(matchingYear ? `publication matches requested year ${requestedYear}` : `publication does not match requested year ${requestedYear}`);
+    }
+    if (result.duplicates.length > 0) {
+      score -= 0.08;
+      reasons.push('duplicate or syndicated result grouped with this URL');
+    }
+    if (copied) {
+      score -= 0.12;
+      reasons.push('snippet closely resembles reporting from another domain');
+    }
+    return { result, score, reasons, copied };
+  });
+
+  // Greedy domain diversity only breaks close scores; direct relevance remains
+  // the dominant part of the ranking.
+  const ranked: RankedSearchCandidate[] = [];
+  while (candidates.length) {
+    candidates.sort((left, right) => {
+      const leftBonus = seenDomains.has(independentDomain(domainOf(left.result.url))) || left.copied ? 0 : 0.035;
+      const rightBonus = seenDomains.has(independentDomain(domainOf(right.result.url))) || right.copied ? 0 : 0.035;
+      return (right.score + rightBonus) - (left.score + leftBonus);
+    });
+    const next = candidates.shift()!;
+    const domain = independentDomain(domainOf(next.result.url));
+    const diversityBonus = seenDomains.has(domain) || next.copied ? 0 : 0.035;
+    seenDomains.add(domain);
+    ranked.push({
+      ...next,
+      score: next.score + diversityBonus,
+      reasons: diversityBonus ? [...next.reasons, 'adds a distinct source domain'] : next.reasons,
+    });
+  }
+  return ranked;
+}
+
+interface CandidateDiagnostic { title: string; url: string; score: number; reasons: string[]; decision: string; sourceId?: string }
+interface FetchSelectionState {
+  attempts: number;
+  attemptedUrls: Set<string>;
+  candidates: CandidateDiagnostic[];
+  replacementsUsed: boolean;
+  replacementCandidatesAttempted: number;
 }
 
 function findDuplicateSource(result: SearchResult, sources: ResearchSource[]): ResearchSource | undefined {
@@ -753,18 +990,66 @@ async function addSearchResults(
   results: SearchResult[],
   query: string,
   existingSources: ResearchSource[],
+  selection: FetchSelectionState,
 ): Promise<number> {
-  const prepared = prepareSearchResults(results);
+  const ranked = rankSearchResults(query, results, existingSources.map((source) => source.domain), existingSources.filter((source) => source.fetchError || source.requiresBrowserRendering).map((source) => source.domain));
   let added = 0;
-  for (const result of prepared) {
+  let usableAdded = 0;
+  for (let index = 0; index < ranked.length; index += 1) {
+    const candidate = ranked[index];
+    const result = candidate.result;
+    const diagnostic: CandidateDiagnostic = { title: result.title, url: result.url, score: candidate.score, reasons: candidate.reasons, decision: 'ranked' };
+    selection.candidates.push(diagnostic);
+    if (usableAdded >= MAX_INITIAL_FETCH_CANDIDATES) {
+      diagnostic.decision = 'skipped; four usable pages already selected for this search';
+      continue;
+    }
     const duplicate = findDuplicateSource(result, existingSources);
     if (duplicate) {
       duplicate.duplicateResults.push(duplicateInfo(result), ...result.duplicates);
+      diagnostic.sourceId = duplicate.id;
+      diagnostic.decision = 'duplicate; existing fetched page reused';
       continue;
     }
+    const normalized = normalizeUrl(result.url);
+    const initial = index < MAX_INITIAL_FETCH_CANDIDATES;
+    diagnostic.decision = initial ? 'selected among initial candidates' : 'replacement candidate';
+    if (!normalized || selection.attemptedUrls.has(normalized)) {
+      diagnostic.decision = 'skipped; URL already attempted or invalid';
+      continue;
+    }
+    if (candidate.score < 0.16) {
+      diagnostic.decision = 'skipped; relevance is too low to justify a fetch attempt';
+      continue;
+    }
+    if (selection.attempts >= MAX_UNIQUE_FETCH_ATTEMPTS) {
+      diagnostic.decision = 'not fetched; six-attempt request limit reached';
+      continue;
+    }
+    selection.attempts += 1;
+    if (!initial) {
+      selection.replacementsUsed = true;
+      selection.replacementCandidatesAttempted += 1;
+    }
+    selection.attemptedUrls.add(normalized);
     const source = await fetchSource(result, `S${existingSources.length + 1}`, query);
+    source.selectionScore = candidate.score;
+    source.selectionReasons = candidate.reasons;
+    source.selectionOutcome = initial ? 'selected' : 'replacement';
+    diagnostic.sourceId = source.id;
     existingSources.push(source);
     added += 1;
+    if (!source.fetchError && source.extractedText.trim().length >= 80 && source.targetRelevance >= 0.15) {
+      usableAdded += 1;
+      diagnostic.decision = initial ? 'selected and usable' : 'replacement selected and usable';
+    } else {
+      source.selectionOutcome = initial ? 'selected' : 'replacement';
+      diagnostic.decision = source.fetchError
+        ? `fetch failed: ${source.fetchError}`
+        : source.requiresBrowserRendering ? 'thin JavaScript shell; browser rendering required' : 'thin or low-relevance extracted page; replacement considered';
+    }
+    // Fetch four usable candidates per search where available. Failed/thin
+    // pages consume attempts and let the next ranked URL replace them.
   }
   return added;
 }
@@ -779,7 +1064,7 @@ const FOLLOWUP_STOP_WORDS = new Set([
 ]);
 
 function isVerificationQuery(query: string): boolean {
-  return /\b(is it true|did anyone|has anyone|was .* proven|has .* been proven|solved|proof|prove|verified|verify|confirmed|confirm)\b/i.test(query);
+  return /\b(is it true|did anyone|has anyone|was .* proven|has .* been proven|solved|disproved|disproven|proof|prove|verified|verify|confirmed|confirm|found a solution)\b/i.test(query);
 }
 
 function followupReason(finding: Finding, verificationQuestion: boolean): string | null {
@@ -804,9 +1089,24 @@ function generateFollowupQueries(query: string, findings: Finding[], reasons: st
     .map((finding) => ({ finding, reason: followupReason(finding, verificationQuestion) }))
     .filter((item): item is { finding: Finding; reason: string } => item.reason !== null)
     .sort((left, right) => Number(right.finding.verificationRequired) - Number(left.finding.verificationRequired)
-      || right.finding.relevanceScore - left.finding.relevanceScore);
+      || right.finding.targetRelevance - left.finding.targetRelevance);
   const selected = candidates.slice(0, MAX_FOLLOWUP_CLAIMS);
   reasons.push(...selected.map(({ finding, reason }) => `${reason}: ${finding.claim.slice(0, 120)}`));
+
+  if (verificationQuestion && selected.length > 0) {
+    const words = meaningfulTokens(query).filter((word) => !FOLLOWUP_STOP_WORDS.has(word));
+    const year = words.find((word) => /^20\d{2}$/.test(word));
+    const topic = words.filter((word) => word !== year).join(' ');
+    const queries = [
+      `${topic} proof ${year ?? ''}`.trim(),
+      `${topic} solved ${year ?? ''} mathematicians`.trim(),
+    ];
+    return queries.map((searchQuery, index) => ({
+      query: searchQuery,
+      reason: selected[Math.min(index, selected.length - 1)].reason,
+      finding: selected[Math.min(index, selected.length - 1)].finding,
+    })).slice(0, MAX_FOLLOWUP_SEARCHES);
+  }
 
   const searches: Array<{ query: string; reason: string; finding: Finding }> = [];
   const makeSearch = (finding: Finding, variant: number): string => {
@@ -846,7 +1146,7 @@ function sortedSources(query: string, sources: ResearchSource[]): ResearchSource
     const published = source.publishedAt ? Date.parse(source.publishedAt) : Number.NaN;
     const ageDays = Number.isFinite(published) ? Math.max(0, (Date.now() - published) / 86_400_000) : null;
     const datePreference = recentQuery && ageDays !== null ? Math.max(-0.15, 0.15 - ageDays / 120) : 0;
-    return source.queryRelevance + (source.fetchError ? -0.2 : 0.1)
+    return source.targetRelevance * 0.7 + source.queryRelevance * 0.3 + (source.fetchError ? -0.2 : 0.1)
       + Math.min(0.08, source.extractedText.length / 20_000) + datePreference
       + (academicQuery && source.sourceType === 'academic' ? 0.08 : 0)
       + (source.sourceType === 'primary' ? 0.03 : 0)
@@ -860,11 +1160,13 @@ export async function researchWebWithSearchProvider(options: ResearchOptions, se
   // are never passed back into followup selection, so researchDepth cannot exceed 1.
   const initialResults = await searchProvider(options.query, options.max_results, options.recency);
   const allSources: ResearchSource[] = [];
-  await addSearchResults(initialResults.slice(0, options.max_results), options.query, allSources);
+  const selection: FetchSelectionState = { attempts: 0, attemptedUrls: new Set(), candidates: [], replacementsUsed: false, replacementCandidatesAttempted: 0 };
+  await addSearchResults(initialResults.slice(0, options.max_results), options.query, allSources, selection);
   const initialFindings = buildFindings(options.query, allSources).findings;
 
   const followupReasons: string[] = [];
-  const plannedClaimFollowups = generateFollowupQueries(options.query, initialFindings, followupReasons);
+  const broadDiscovery = isBroadCurrentEventsQuery(options.query) && !isVerificationQuery(options.query);
+  const plannedClaimFollowups = broadDiscovery ? [] : generateFollowupQueries(options.query, initialFindings, followupReasons);
   const limitations: string[] = [];
   const initialIndependentCounts = new Map(initialFindings.map((finding) => [finding.sourceIds.join('|'), finding.independentSourceCount]));
   let searchCount = 1;
@@ -891,7 +1193,7 @@ export async function researchWebWithSearchProvider(options: ResearchOptions, se
       results = await searchProvider(followup.query, options.max_results, options.recency);
     } catch {
       limitations.push('A follow-up search failed; the initial research results are retained.');
-      if (!recoveryUsed && searchCount < 1 + MAX_FOLLOWUP_SEARCHES) {
+      if ((!recoveryUsed || broadDiscovery) && searchCount < 1 + MAX_FOLLOWUP_SEARCHES) {
         const reason = 'a follow-up search failed before returning results';
         followups.splice(index + 1, 0, { query: makeRecoveryQuery(options.query, nextRecoveryVariant++), reason, isRecovery: true });
         followupReasons.push(`search adequacy recovery: ${reason}`);
@@ -902,13 +1204,13 @@ export async function researchWebWithSearchProvider(options: ResearchOptions, se
     discoveredCount += results.length;
     allSearchResults.push(...results);
     const sourceCountBefore = allSources.length;
-    const added = await addSearchResults(results.slice(0, options.max_results), options.query, allSources);
+    const added = await addSearchResults(results.slice(0, options.max_results), options.query, allSources, selection);
     if (results.length === 0 || added === 0) {
       limitations.push('Follow-up search did not find new independent sources; this absence is not evidence that a claim is false.');
     }
     const batchSources = allSources.slice(sourceCountBefore);
     const adequacy = checkSearchAdequacy(options.query, results, batchSources);
-    if (!adequacy.adequate && !recoveryUsed && searchCount < 1 + MAX_FOLLOWUP_SEARCHES) {
+    if (!adequacy.adequate && (!recoveryUsed || broadDiscovery) && searchCount < 1 + MAX_FOLLOWUP_SEARCHES) {
       followups.splice(index + 1, 0, {
         query: makeRecoveryQuery(options.query, nextRecoveryVariant++),
         reason: adequacy.reasons.join('; '),
@@ -933,20 +1235,29 @@ export async function researchWebWithSearchProvider(options: ResearchOptions, se
   }
 
   const failedPages = finalSources.filter((source) => source.fetchError);
-  const usablePages = finalSources.filter((source) => !source.fetchError && source.extractedText.trim().length >= 40);
+  const usablePages = finalSources.filter((source) => !source.fetchError && source.extractedText.trim().length >= 80 && source.targetRelevance >= 0.15);
+  const distinctDomains = new Set(usablePages.map((source) => independentDomain(source.domain))).size;
+  const independentCorroboratingSources = independentSourceCount(usablePages);
+  const broadNews = isBroadCurrentEventsQuery(options.query) && !isVerificationQuery(options.query);
+  const recentDevelopments = findings.filter((finding) => {
+    const published = finding.publishedAt ? Date.parse(finding.publishedAt) : Number.NaN;
+    return Number.isFinite(published) && (Date.now() - published) / 86_400_000 <= (/\bthis week\b/i.test(options.query) ? 14 : 45);
+  }).length;
   limitations.unshift(
     'Source-type labels use simple domain and URL-pattern heuristics. They are descriptive and are not an authoritative classification or quality ranking.',
     'Relevance, statement type, follow-up selection, and claim grouping use deterministic heuristics; they do not establish truth.',
     'Independent-source counts estimate domain and copied-page differences; duplicated reporting may still be counted as independent.',
-    'Only fetched pages with at least 40 characters of extracted text are considered usable evidence.',
+    'Only fetched pages with at least 80 characters of relevant extracted text are considered usable evidence.',
   );
-  for (const source of failedPages) limitations.push(`${source.id} (${source.domain}) was not used as evidence: ${source.fetchError}`);
-  for (const source of finalSources.filter((item) => !item.fetchError && item.extractedText.trim().length < 40)) limitations.push(`${source.id} (${source.domain}) returned too little readable text to support findings.`);
+  for (const source of failedPages) limitations.push(`${source.id} (${source.domain}) was not used as evidence: ${source.requiresBrowserRendering ? 'the page requires browser rendering.' : source.fetchError}`);
+  for (const source of finalSources.filter((item) => item.requiresBrowserRendering)) limitations.push(`${source.id} (${source.domain}) returned a JavaScript-rendered shell; browser rendering is required and was not attempted.`);
+  for (const source of finalSources.filter((item) => !item.fetchError && (item.extractedText.trim().length < 80 || item.targetRelevance < 0.15))) limitations.push(`${source.id} (${source.domain}) returned too little relevant readable text to support findings.`);
+  for (const source of finalSources.filter((item) => item.truncated)) limitations.push(`${source.id} (${source.domain}) extracted text was truncated at ${MAX_EXTRACTED_TEXT_CHARS} characters.`);
   if (findings.length === 0) limitations.push('No relevant factual claims could be extracted from the fetched pages.');
   if (usablePages.length < 2) limitations.push('Research coverage is limited because fewer than two pages yielded usable extracted text.');
 
   const retrievedAt = new Date().toISOString();
-  const summarySources = finalSources.map(({ id, title, url, domain, sourceType, publishedAt, relevanceScore, queryRelevance, retrievedAt: sourceRetrievedAt, fetchError }) => ({ id, title, url, domain, sourceType, publishedAt, relevanceScore, queryRelevance, retrievedAt: sourceRetrievedAt, ...(fetchError ? { fetchError } : {}) }));
+  const summarySources = finalSources.map(({ id, title, url, domain, sourceType, publishedAt, relevanceScore, queryRelevance, targetRelevance, selectionScore, selectionReasons, selectionOutcome, truncated, requiresBrowserRendering, retrievedAt: sourceRetrievedAt, fetchError }) => ({ id, title, url, domain, sourceType, publishedAt, relevanceScore, queryRelevance, targetRelevance, selectionScore, selectionReasons, selectionOutcome, truncated, requiresBrowserRendering, retrievedAt: sourceRetrievedAt, ...(fetchError ? { fetchError } : {}) }));
   const trace: ResearchTrace = {
     initialSearches: 1,
     followupSearches: searchCount - 1,
@@ -963,7 +1274,21 @@ export async function researchWebWithSearchProvider(options: ResearchOptions, se
     followupSearchCount: searchCount - 1,
     researchDepth: searchCount > 1 ? 1 : 0,
     trace,
-    coverage: { searchResults: discoveredCount, uniqueSources: finalSources.length, fetchedPages: finalSources.length, usablePages: usablePages.length, failedPages: failedPages.length, adequate: finalAdequacy.adequate, adequacyReasons },
+    researchTarget: researchTargetFor(options.query),
+    sourceSelection: {
+      totalResultsDiscovered: discoveredCount,
+      candidatesRanked: selection.candidates.length,
+      fetchAttempts: selection.attempts,
+      pagesSuccessfullyFetched: finalSources.filter((source) => !source.fetchError).length,
+      usablePages: usablePages.length,
+      failedPages: failedPages.length,
+      truncatedPages: finalSources.filter((source) => source.truncated).length,
+      replacementsUsed: selection.replacementsUsed,
+      replacementCandidatesAttempted: selection.replacementCandidatesAttempted,
+      adequatelyAnswersTarget: finalAdequacy.adequate && findings.some((finding) => !isVerificationQuery(options.query) || finding.targetRelevance >= 0.60),
+      candidates: selection.candidates,
+    },
+    coverage: { searchResults: discoveredCount, uniqueSources: finalSources.length, fetchedPages: selection.attempts, usablePages: usablePages.length, failedPages: failedPages.length, distinctDomains, distinctDevelopments: findings.length, recentDevelopments: broadNews ? recentDevelopments : findings.length, independentCorroboratingSources, unresolvedMaterialConflicts: disagreements.length, adequate: finalAdequacy.adequate, adequacyReasons },
     findings,
     sources: summarySources,
     corroboration: findings.map(({ claim, sourceIds, corroborationCount, status }) => ({ claim, sourceIds, corroborationCount, status })),
