@@ -5,7 +5,7 @@ import { formatResearchResponse } from './response.js';
 
 type FixtureProvider = Parameters<typeof researchWebWithSearchProvider>[1];
 
-function result(title: string, url: string, publishedDate = '2026-10-02'): SearchResult {
+function result(title: string, url: string, publishedDate = new Date().toISOString().slice(0, 10)): SearchResult {
   return { title, url, content: title, score: 0.9, publishedDate };
 }
 
@@ -56,7 +56,7 @@ test('major single-source claim triggers two bounded searches, merges sources, a
   const claim = output.research.findings.find((finding) => finding.type === 'claim');
   assert.ok(claim, 'the major claim should remain labeled as a claim');
   assert.equal(claim.verificationRequired, true);
-  assert.equal(claim.corroborationStatus, 'corroborated');
+  assert.equal(claim.corroborationStatus, 'corroborated', JSON.stringify({ claim, sources: output.research.sources }));
   assert.equal(claim.sourceCount, 2);
   assert.equal(claim.independentSourceCount, 2);
   assert.equal(output.sources.length, 2, 'the follow-up URL alias should not create a third source');
@@ -71,6 +71,37 @@ test('major single-source claim triggers two bounded searches, merges sources, a
   assert.ok(output.research.trace.sourcesDiscovered >= output.sources.length);
   assert.equal(output.research.trace.sourcesUsed, 2);
   assert.ok(claim.evidence.every((item) => output.sources.find((source) => source.id === item.sourceId)?.extractedText.includes(item.sentence)));
+});
+
+test('Riemann verification recognizes readable direct answers and ignores idiomatic and inaccessible proof mentions', async () => {
+  const searches: string[] = [];
+  const provider: FixtureProvider = async (query) => {
+    searches.push(query);
+    return [
+      result("Claude's progress on the Riemann hypothesis", 'https://www.anthropic.com/research/riemann-zeta', '2026-08-10'),
+      result('Did Claude prove the Riemann Hypothesis?', 'https://mindstudio.example/claude-riemann', '2026-08-13'),
+      result('Why no one is trying to solve math’s greatest mystery', 'https://www.scientificamerican.com/article/riemann', '2026-06-01'),
+      result('A Direct Proof of the Riemann Hypothesis - 2026', 'https://www.youtube.com/watch?v=example', '2026-09-14'),
+    ];
+  };
+  const output = await withPages({
+    'www.anthropic.com/research/riemann-zeta': 'Claude did take a real stab at the Riemann Hypothesis, but it did not succeed. An unreleased research model improved a related lower bound from 41.6% to 67.2%. Even though it could not resolve the Riemann Hypothesis itself, this was progress on a related problem. No one has yet been able to prove or disprove the Riemann Hypothesis.',
+    'mindstudio.example/claude-riemann': 'The Riemann Hypothesis remains unproven. Claude did not prove the Riemann Hypothesis, but improved a specific related numerical bound from 41.6 to 67.2. This does not amount to a proof of the conjecture.',
+    'www.scientificamerican.com/article/riemann': 'The Riemann hypothesis has proved to be a font of surprising connections in mathematics. In 2000, a bounty was offered to anyone who solved the Riemann hypothesis. Mathematicians continue to study this historical conjecture.',
+    // YouTube intentionally returns a thin HTML shell and must not contribute evidence.
+  }, () => researchWebWithSearchProvider(verifyQuery, provider));
+
+  const direct = output.research.findings.find((finding) => /no one has yet|remains unproven|did not prove|could not resolve|did not succeed/i.test(finding.claim));
+  assert.ok(direct, JSON.stringify(output.research.findings.map((finding) => finding.claim)));
+  assert.ok(direct.targetRelevance >= 0.6);
+  assert.equal(direct.independentSourceCount, 2, JSON.stringify(output.research.findings.map(({ claim, sourceIds, type, targetRelevance }) => ({ claim, sourceIds, type, targetRelevance }))));
+  assert.ok(output.research.sourceSelection.adequatelyAnswersTarget, JSON.stringify(output.research.sourceSelection));
+  assert.ok(output.research.coverage.adequate, JSON.stringify(output.research.coverage));
+  assert.ok(searches.length <= 3, 'verification follow-ups remain within the existing three-search cap');
+  assert.ok(!output.research.findings.some((finding) => /font of surprising connections|bounty was offered/i.test(finding.claim)));
+  assert.ok(!output.research.findings.some((finding) => finding.claim.includes('Direct Proof of the Riemann')));
+  assert.match(formatResearchResponse(output), /Across 2 independent sources|remains unproven|did not prove/i);
+  assert.match(formatResearchResponse(output), /inaccessible and excluded as evidence/i);
 });
 
 test('an ordinary background question does not automatically trigger follow-up', async () => {
@@ -201,8 +232,8 @@ test('failed recovery returns an honest insufficient-evidence answer without irr
   const text = formatResearchResponse(output);
 
   assert.equal(searches, 3, 'the bounded broad-news controller uses its remaining discovery search after a failed recovery');
-  assert.match(text, /couldn't gather enough reliable evidence/i);
-  assert.match(text, /did not provide enough usable source content/i);
+  assert.match(text, /couldn't identify current developments about AI/i);
+  assert.match(text, /does not mean nothing happened/i);
   assert.doesNotMatch(text, /MarketBeat|Research completed using|searches and \d+ sources/i);
   assert.ok(output.research.limitations.includes('A follow-up search failed; the initial research results are retained.'));
 });
@@ -229,7 +260,7 @@ test('successful recovery summarizes findings without exposing internal counters
   const text = formatResearchResponse(output);
 
   assert.equal(output.research.coverage.adequate, true, JSON.stringify(output.research.coverage));
-  assert.match(text, /key findings about What happened in AI this week/i);
+  assert.match(text, /Research brief — AI/i);
   assert.doesNotMatch(text, /Research completed using|searchCount|followupSearchCount|sourcesDiscovered|claimsExtracted/);
 });
 
@@ -244,7 +275,7 @@ test('search-result ranking prefers relevant results over irrelevant ones', () =
 test('direct-answer pages rank above generic background pages for verification questions', () => {
   const ranked = rankSearchResults('Did anyone solve the Riemann Hypothesis in 2026?', [
     { ...result('History and definition of the Riemann Hypothesis', 'https://reference.example/history'), content: 'History of the Riemann Hypothesis, proposed in 1859.' },
-    { ...result('Riemann Hypothesis proof status in 2026', 'https://math.example/status'), content: 'Mathematicians discuss whether a proof solved the Riemann Hypothesis in 2026.' },
+    { ...result('Riemann Hypothesis proof status in 2026', 'https://math.example/status'), content: 'The Riemann Hypothesis remains unproven in 2026; no proof has been published.' },
   ]);
   assert.equal(ranked[0].result.url, 'https://math.example/status');
   assert.ok(ranked[0].reasons.some((reason) => reason.includes('directly addresses')));
@@ -385,9 +416,31 @@ test('thin JavaScript-rendered pages are marked as requiring browser rendering',
   const html = '<html><head><title>AI research application</title></head><body><div id="app"></div><script>renderResearchPage()</script></body></html>';
   const output = await withPages({ 'javascript.example/app': html }, () => researchWebWithSearchProvider(
     { query: 'What is AI research?', max_results: 1, recency: 'any' }, provider,
+    async () => { throw new Error('fixture browser unavailable'); },
   ));
   assert.equal(output.sources[0].requiresBrowserRendering, true);
-  assert.ok(output.research.limitations.some((item) => item.includes('browser rendering is required')));
+  assert.equal(output.sources[0].browserRenderingAttempted, true);
+  assert.match(output.sources[0].browserRenderingError ?? '', /fixture browser unavailable/);
+  assert.ok(output.research.limitations.some((item) => item.includes('remained unreadable after browser rendering')));
+});
+
+test('Playwright fallback uses rendered article text after HTTP returns a JavaScript shell', async () => {
+  const provider: FixtureProvider = async () => [result('What is AGI?', 'https://javascript.example/agi')];
+  const shell = '<html><head><title>What is AGI?</title></head><body><div id="app"></div><script>render()</script></body></html>';
+  let renderedUrl = '';
+  const output = await withPages({ 'javascript.example/agi': shell }, () => researchWebWithSearchProvider(
+    { query: 'What is AGI?', max_results: 1, recency: 'any' }, provider,
+    async (url) => {
+      renderedUrl = url;
+      return { html: '<html><head><title>AGI explained</title></head><body><article><h1>Artificial general intelligence (AGI)</h1><p>Artificial general intelligence is a research goal for systems that can perform a broad range of intellectual tasks.</p><p>Researchers study AGI as a long-term objective in artificial intelligence.</p></article></body></html>', truncated: false };
+    },
+  ));
+  const source = output.sources[0];
+  assert.equal(renderedUrl, 'https://javascript.example/agi');
+  assert.equal(source.browserRenderingAttempted, true);
+  assert.equal(source.requiresBrowserRendering, false);
+  assert.match(source.extractedText, /broad range of intellectual tasks/);
+  assert.ok(output.research.findings.some((finding) => finding.sourceIds.includes(source.id)));
 });
 
 test('Riemann verification findings outrank historical background', async () => {
@@ -481,4 +534,74 @@ test('copied reports across domains do not inflate independent corroboration', a
   assert.equal(finding.sourceCount, 2);
   assert.equal(finding.independentSourceCount, 1);
   assert.equal(finding.corroborationStatus, 'single_source');
+});
+
+test('broad current-week answers exclude stale tracker claims and lead with a useful partial roundup', async () => {
+  const searches: string[] = [];
+  const provider: FixtureProvider = async (query) => {
+    searches.push(query);
+    if (searches.length > 1) return [];
+    return [
+      result('AI News: Artificial Intelligence Stories, Ranked', 'https://aiweekly.example/issue', 'Tue, 06 Oct'),
+      result('AI Safety Funding Tracker (170 deals)', 'https://newmarketpitch.example/tracker', '2026-02-18'),
+    ];
+  };
+  const output = await withPages({
+    'aiweekly.example/issue': '<html><head><title>AI Weekly #536</title></head><body><article><h1>#536 Top AI models failed a test of inventing new AI research</h1><p>This issue is built from links the AI experts we follow shared over the past three days.</p></article></body></html>',
+    'newmarketpitch.example/tracker': '<html><head><title>AI Safety Funding Tracker (170 deals)</title><meta property="article:published_time" content="2026-02-18"></head><body><article><p>AI safety is already a multibillion-dollar venture market, but the typical startup is still raising single-digit millions. This analysis describes several AI safety market categories.</p></article></body></html>',
+  }, () => researchWebWithSearchProvider(
+    { query: 'What happened in AI this week?', max_results: 5, recency: 'week' }, provider,
+  ));
+  const text = formatResearchResponse(output);
+
+  assert.equal(searches.length, 3, 'inadequate coverage consumes no more than two recovery searches');
+  assert.ok(output.research.findings.length >= 1, JSON.stringify({ sources: output.sources.map(({ id, url, fetchError, publishedAt, extractedText }) => ({ id, url, fetchError, publishedAt, text: extractedText })), candidates: output.research.sourceSelection.candidates }));
+  assert.ok(output.research.findings.every((finding) => !/single-digit millions|multibillion-dollar venture market/i.test(finding.claim)));
+  assert.match(text, /Coverage is partial/i);
+  assert.doesNotMatch(text, /I found limited evidence|single-digit millions|multibillion-dollar venture market|Tue, 06 Oc\./i);
+  assert.match(text, /Oct 6/);
+  assert.ok(output.research.sourceSelection.candidates.some((item) => item.decision.includes('outside the requested time window')));
+  assert.equal(output.research.coverage.recentDevelopments, output.research.findings.length);
+});
+
+test('answer formatter presents AGI research as a concise brief with grouped claims and clean dates', async () => {
+  const provider: FixtureProvider = async () => [
+    result('What is AGI? - Artificial General Intelligence Explained - AWS', 'https://aws.example/agi'),
+    result('What is Artificial General Intelligence?', 'https://databricks.example/agi'),
+  ];
+  const output = await withPages({
+    'aws.example/agi': '<html><head><title>What is AGI? - Artificial General Intelligence Explained - AWS</title><meta property="article:published_time" content="Sun, 06 Sep 2026 03:00:00 GMT"></head><body><article><h1>What is AGI (Artificial General Intelligence)?</h1><p>AGI with human abilities remains a theoretical concept and research goal.</p><p>Artificial general intelligence is a field of theoretical AI research that attempts to create software with human-like intelligence and the ability to self-teach.</p></article></body></html>',
+    'databricks.example/agi': '<html><head><title>What is Artificial General Intelligence?</title><meta property="article:published_time" content="Sun, 06 Sep 2026 03:00:00 GMT"></head><body><article><p>AGI with human abilities remains a theoretical concept and research goal. The term describes a long-term objective in artificial intelligence research.</p></article></body></html>',
+  }, () => researchWebWithSearchProvider(
+    { query: 'What is AGI?', max_results: 5, recency: 'any' }, provider,
+  ));
+  const text = formatResearchResponse(output);
+
+  assert.match(text, /Research brief — What is AGI/i);
+  assert.match(text, /\*\*Summary\*\*/);
+  assert.match(text, /\*\*Key findings\*\*/);
+  assert.match(text, /Sep 6, 2026/);
+  assert.match(text, /AWS/);
+  assert.match(text, /databricks\.example/, JSON.stringify(output.research.sourceSelection.candidates));
+  assert.doesNotMatch(text, /I found limited evidence|Potential findings|What is AGI \(Artificial General Intelligence\)\?/i);
+  assert.doesNotMatch(text, /03:00:00 GMT/);
+});
+
+test('a focused latest-model query honors recency year instead of being treated as a 30-day news roundup', async () => {
+  const query = 'What are the latest AI models that use genetic algorithms or evolutionary learning?';
+  const candidate = result(
+    'New AI model for DNA learns from evolution to unlock secrets of the human genome - Berkeley News',
+    'https://news.berkeley.example/ai-dna-evolution',
+    '2026-09-09',
+  );
+  candidate.content = 'Researchers introduced a new AI model for DNA that learns from evolution to identify patterns in the human genome.';
+  const provider: FixtureProvider = async (searchQuery) => searchQuery === query ? [candidate] : [];
+  const output = await withPages({
+    'news.berkeley.example/ai-dna-evolution': '<html><head><title>New AI model learns from evolution</title><meta property="article:published_time" content="2026-09-09"></head><body><article><p>Researchers introduced a new AI model for DNA that learns from evolution to identify patterns in the human genome. The model learns evolutionary patterns from genomes and supports new genetic research.</p></article></body></html>',
+  }, () => researchWebWithSearchProvider({ query, max_results: 5, recency: 'year' }, provider));
+
+  assert.ok(output.sources.some((source) => source.url === candidate.url));
+  assert.ok(output.sources.find((source) => source.url === candidate.url)?.extractedText.length! >= 80);
+  assert.ok(!output.research.sourceSelection.candidates.some((item) => item.url === candidate.url && item.decision.includes('outside the requested time window')));
+  assert.ok(!output.research.limitations.some((item) => item.includes('outside the requested time window')));
 });
